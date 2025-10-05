@@ -83,15 +83,6 @@ Type: Transfer block
 
 ---
 
-## Security Warning
-
-⚠️ **NEVER use your real wallet for testing**
-- Use a test wallet with minimal funds
-- Default test amount: 1000 WPLS
-- You will lose this amount if it's a honeypot
-
----
-
 ## Troubleshooting
 
 **Error: 'cast' not found**

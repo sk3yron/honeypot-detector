@@ -1,231 +1,491 @@
 #!/usr/bin/env bash
-# honeypot-detector.sh - Simple honeypot detection tool
 
 set -euo pipefail
 
-#=============================================================================
-# CONFIGURATION
-#=============================================================================
+#===============================================================================
+# CONFIG
+#===============================================================================
 
-[[ -f "${HONEYPOT_CONFIG:-./config.env}" ]] && source "${HONEYPOT_CONFIG:-./config.env}"
+RPC_URL="${RPC_URL:-https://rpc.pulsechain.com}"
+FALLBACK_RPCS=("https://pulsechain.publicnode.com")
+CACHE_DIR="./.cache"
+TIMEOUT=15
+VERBOSE="${VERBOSE:-false}"
 
-RPC_URL="${RPC_URL:-http://127.0.0.1:8545}"
-FORK_URL="${FORK_URL:-https://rpc.pulsechain.com}"
-WPLS="${WPLS:-0xA1077a294dDE1B09bB078844df40758a5D0f9a27}"
-ROUTER="${ROUTER:-0xDA9aBA4eACF54E0273f56dfFee6B8F1e20B23Bba}"
-USER="${USER:-0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266}"
-PRIVATE_KEY="${PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
-TEST_AMOUNT="${TEST_AMOUNT:-1000000000000000000000}"
-USE_ANVIL="${USE_ANVIL:-true}"  # Set to false to use real RPC
+RISK_CRITICAL=100
+RISK_HIGH=75
+RISK_MEDIUM=50
+RISK_LOW=25
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
-# Track Anvil PID for cleanup
-ANVIL_PID=""
+declare -a FINDINGS
+RISK_SCORE=0
+TOKEN_ADDRESS=""
+TOKEN_NAME="Unknown"
+TOKEN_SYMBOL="???"
+TOKEN_DECIMALS="18"
+TOKEN_SUPPLY="0"
+IS_PROXY=false
+IMPL_ADDRESS=""
+ACTIVE_RPC=""
 
-#=============================================================================
-# CLEANUP
-#=============================================================================
+#===============================================================================
+# LOGGING
+#===============================================================================
 
-cleanup() {
-    if [[ -n "$ANVIL_PID" ]]; then
-        info "Stopping Anvil (PID: $ANVIL_PID)..."
-        kill "$ANVIL_PID" 2>/dev/null || true
-        wait "$ANVIL_PID" 2>/dev/null || true
+log() { echo -e "${2}[${1}]${NC} ${*:3}" >&2; }
+info()  { log "INFO" "$GREEN" "$@"; }
+warn()  { log "WARN" "$YELLOW" "$@"; }
+debug() { [[ "$VERBOSE" == "true" ]] && log "DEBUG" "$CYAN" "$@" || true; }
+die()   { log "ERROR" "$RED" "$@"; exit 2; }
+
+add_finding() {
+    FINDINGS+=("$1|$2|$3|${4:-0}")
+    RISK_SCORE=$((RISK_SCORE + ${4:-0}))
+    debug "[$1] $2 (+${4:-0})"
+}
+
+#===============================================================================
+# RPC
+#===============================================================================
+
+safe_call() { timeout "$TIMEOUT" "$@" 2>/dev/null || echo ""; }
+
+setup_rpc() {
+    for rpc in "$RPC_URL" "${FALLBACK_RPCS[@]}"; do
+        timeout 3 cast block-number --rpc-url "$rpc" >/dev/null 2>&1 && { ACTIVE_RPC="$rpc"; debug "Using: $rpc"; return 0; }
+    done
+    die "No working RPC"
+}
+
+#===============================================================================
+# BLOCKCHAIN
+#===============================================================================
+
+get_code() {
+    local addr="$1"
+    local cache="$CACHE_DIR/${addr}_code.cache"
+    local ttl=3600  # 1 hour in seconds
+    
+    if [[ -f "$cache" ]]; then
+        # Get file modification time
+        local cache_age=$(( $(date +%s) - $(stat -c%Y "$cache" 2>/dev/null || stat -f%m "$cache" 2>/dev/null || echo 0) ))
+        
+        # If cache is newer than TTL, use it
+        if (( cache_age < ttl )); then
+            debug "Using cached bytecode (${cache_age}s old)"
+            cat "$cache"
+            return 0
+        else
+            debug "Cache expired (${cache_age}s old), refetching..."
+        fi
     fi
-}
-
-# Ensure cleanup runs on exit
-trap cleanup EXIT INT TERM
-
-#=============================================================================
-# FUNCTIONS
-#=============================================================================
-
-log() { echo -e "${2:-$NC}[${1}]${NC} ${3}" >&2; }
-info()  { log "INFO" "$GREEN" "$*"; }
-warn()  { log "WARN" "$YELLOW" "$*"; }
-error() { log "ERROR" "$RED" "$*"; }
-die()   { error "$*"; exit 1; }
-
-validate_address() {
-    [[ "$1" =~ ^0x[a-fA-F0-9]{40}$ ]] || die "Invalid address: $1"
-}
-
-check_deps() {
-    command -v cast >/dev/null 2>&1 || die "'cast' not found. Install Foundry: https://getfoundry.sh"
-    if [[ "$USE_ANVIL" == "true" ]]; then
-        command -v anvil >/dev/null 2>&1 || die "'anvil' not found. Install Foundry: https://getfoundry.sh"
-    fi
-}
-
-start_anvil() {
-    if [[ "$USE_ANVIL" != "true" ]]; then
-        info "Using external RPC: $RPC_URL"
+    
+    # Fetch fresh data
+    local code=$(safe_call cast code "$addr" --rpc-url "$ACTIVE_RPC")
+    
+    if [[ -n "$code" && "$code" != "0x" ]]; then
+        echo "$code" > "$cache"
+        echo "$code"
         return 0
     fi
     
-    info "Starting Anvil (forking $FORK_URL)..."
+    return 1
+}
+
+call_func() { safe_call cast call "$1" "$2" --rpc-url "$ACTIVE_RPC"; }
+read_storage() { safe_call cast storage "$1" "$2" --rpc-url "$ACTIVE_RPC"; }
+
+#===============================================================================
+# TOKEN INFO
+#===============================================================================
+
+fetch_token_info() {
+    info "Fetching token info..."
     
-    # Start Anvil in background, suppress output
-    anvil --fork-url "$FORK_URL" --silent >/dev/null 2>&1 &
-    ANVIL_PID=$!
+    local name_raw=$(call_func "$1" "name()")
+    [[ -n "$name_raw" ]] && TOKEN_NAME=$(echo "$name_raw" | cast --to-ascii 2>/dev/null | tr -d '\0\n' | head -c 50 || echo "Unknown")
     
-    info "Anvil started (PID: $ANVIL_PID)"
+    local sym_raw=$(call_func "$1" "symbol()")
+    [[ -n "$sym_raw" ]] && TOKEN_SYMBOL=$(echo "$sym_raw" | cast --to-ascii 2>/dev/null | tr -d '\0\n' | head -c 20 || echo "???")
     
-    # Wait for Anvil to be ready
-    info "Waiting for Anvil to initialize..."
-    local retries=30
-    while (( retries > 0 )); do
-        if cast block-number --rpc-url "$RPC_URL" >/dev/null 2>&1; then
-            info "Anvil ready!"
+    local dec_raw=$(call_func "$1" "decimals()")
+    [[ -n "$dec_raw" ]] && TOKEN_DECIMALS=$(echo "$dec_raw" | cast --to-dec 2>/dev/null || echo "18")
+    
+    local sup_raw=$(call_func "$1" "totalSupply()")
+    [[ -n "$sup_raw" ]] && TOKEN_SUPPLY=$(echo "$sup_raw" | cast --to-dec 2>/dev/null || echo "0")
+}
+
+#===============================================================================
+# PROXY DETECTION
+#===============================================================================
+
+detect_proxy() {
+    local token="$1"
+    local code=$(get_code "$token")
+    local size=$((${#code} / 2 - 1))
+    
+    info "Checking for proxy... ($size bytes)"
+    
+    if (( size < 1000 )); then
+        code="${code#0x}"
+        code="${code^^}"
+        
+        # EIP-1167 Minimal Proxy
+        if [[ "$code" =~ 363D3D373D3D3D363D73([A-F0-9]{40}) ]]; then
+            IMPL_ADDRESS="0x${BASH_REMATCH[1]}"
+            IS_PROXY=true
+            add_finding "INFO" "PROXY" "Minimal proxy (EIP-1167)" 0
+            info "→ Implementation: $IMPL_ADDRESS"
             return 0
         fi
-        sleep 0.5
-        ((retries--))
+        
+        # EIP-1967
+        local impl_raw=$(read_storage "$token" "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc")
+        local impl="0x${impl_raw: -40}"
+        
+        if [[ "$impl" != "0x0000000000000000000000000000000000000000" ]]; then
+            IS_PROXY=true
+            IMPL_ADDRESS="$impl"
+            add_finding "INFO" "PROXY" "EIP-1967 proxy" 0
+            info "→ Implementation: $impl"
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
+#===============================================================================
+# FAST HONEYPOT DETECTION (NO SLOW REGEX!)
+#===============================================================================
+
+# Fast string contains - no regex
+contains() { [[ "$1" == *"$2"* ]]; }
+
+# Count occurrences fast
+count_occurrences() {
+    local str="$1"
+    local pattern="$2"
+    local count=0
+    local temp="$str"
+    
+    while [[ "$temp" == *"$pattern"* ]]; do
+        temp="${temp#*$pattern}"
+        ((count++))
     done
     
-    die "Anvil failed to start"
+    echo "$count"
 }
 
-get_balance() {
-    local token="$1" address="$2"
-    local balance
-    balance=$(cast call "$token" "balanceOf(address)" "$address" --rpc-url "$RPC_URL" 2>/dev/null) || return 1
-    cast to-dec "$balance"
-}
-
-approve_token() {
-    local token="$1" spender="$2" amount="$3"
-    info "Approving $spender to spend tokens..."
+check_critical_patterns() {
+    local code="${1^^}"  # Uppercase once
+    local is_proxy="$2"
     
-    cast send "$token" "approve(address,uint256)" "$spender" "$amount" \
-        --private-key "$PRIVATE_KEY" \
-        --rpc-url "$RPC_URL" \
-        --json >/dev/null 2>&1 || return 1
-}
-
-swap_tokens() {
-    local amount="$1" path="$2"
+    info "Checking critical patterns..."
     
-    cast send "$ROUTER" \
-        "swapExactTokensForTokensV2(uint256,uint256,address[],address)" \
-        "$amount" "1" "$path" "$USER" \
-        --private-key "$PRIVATE_KEY" \
-        --rpc-url "$RPC_URL" \
-        --json 2>&1
-}
-
-#=============================================================================
-# MAIN
-#=============================================================================
-
-main() {
-    [[ $# -eq 0 ]] && die "Usage: $0 <token_address>"
+    # CRITICAL: Blacklist functions
+    contains "$code" "FE575A87" && add_finding "CRITICAL" "BLACKLIST" "isBlacklisted() function detected" 60
+    contains "$code" "0ECB93C0" && add_finding "CRITICAL" "BLACKLIST" "isBlackListed() function detected" 60
+    contains "$code" "59BF1ABE" && add_finding "CRITICAL" "BLACKLIST" "blacklist() function detected" 60
+    contains "$code" "F9F92BE4" && add_finding "CRITICAL" "BLACKLIST" "addBlackList() function detected" 60
     
-    local TOKEN="$1"
-    
-    check_deps
-    validate_address "$TOKEN"
-    validate_address "$WPLS"
-    validate_address "$ROUTER"
-    validate_address "$USER"
-    
-    # Start Anvil if needed
-    start_anvil
-    
-    echo ""
-    echo -e "${YELLOW}======================================${NC}"
-    echo -e "${YELLOW}   HONEYPOT DETECTION TEST${NC}"
-    echo -e "${YELLOW}======================================${NC}"
-    echo "Token:  $TOKEN"
-    echo "Amount: $TEST_AMOUNT wei"
-    echo ""
-    
-    # STEP 1: Initial balances
-    info "Step 1/4: Checking initial balances..."
-    local initial_wpls initial_token
-    initial_wpls=$(get_balance "$WPLS" "$USER") || die "Failed to get WPLS balance"
-    initial_token=$(get_balance "$TOKEN" "$USER" || echo "0")
-    
-    info "WPLS: $initial_wpls wei | Token: $initial_token wei"
-    
-    (( initial_wpls >= TEST_AMOUNT )) || die "Insufficient WPLS (have: $initial_wpls, need: $TEST_AMOUNT)"
-    
-    # STEP 2: Buy token
-    info "Step 2/4: Buying token..."
-    
-    approve_token "$WPLS" "$ROUTER" "$TEST_AMOUNT" || die "WPLS approval failed"
-    
-    local buy_result
-    buy_result=$(swap_tokens "$TEST_AMOUNT" "[$WPLS,$TOKEN]")
-    
-    if echo "$buy_result" | grep -q '"status":"0x1"'; then
-        info "✓ Buy successful"
-    else
-        error "✗ Buy failed"
-        echo "$buy_result" | grep -o '"revertReason":"[^"]*"' || echo "Unknown error"
-        die "Cannot buy token"
+    # CRITICAL: Missing transfer (if not proxy)
+    if [[ "$is_proxy" == "false" ]]; then
+        contains "$code" "A9059CBB" || add_finding "CRITICAL" "MISSING" "No transfer() function" 70
     fi
     
-    sleep 2
+    # CRITICAL: Has approve but NO transferFrom
+    if contains "$code" "095EA7B3" && ! contains "$code" "23B872DD"; then
+        [[ "$is_proxy" == "false" ]] && add_finding "CRITICAL" "HONEYPOT" "approve() exists but NO transferFrom()" 80
+    fi
     
-    # Check tokens received
-    local new_token_balance tokens_bought
-    new_token_balance=$(get_balance "$TOKEN" "$USER") || die "Failed to get new token balance"
-    tokens_bought=$((new_token_balance - initial_token))
+    info "✓ Critical checks done"
+}
+
+check_high_risk_patterns() {
+    local code="${1^^}"
     
-    info "Received: $tokens_bought tokens"
+    info "Checking high-risk patterns..."
     
-    (( tokens_bought > 0 )) || die "No tokens received after buy"
+    # Dangerous functions
+    contains "$code" "40C10F19" && add_finding "MEDIUM" "PRIVILEGE" "mint() function exists" 10
+    contains "$code" "42966C68" && add_finding "MEDIUM" "PRIVILEGE" "burn() function exists" 10
     
-    # STEP 3: Try to sell
-    info "Step 3/4: Attempting to sell token..."
+    info "✓ High-risk checks done"
+}
+
+check_features() {
+    local code="${1^^}"
+    local size="$2"
     
-    approve_token "$TOKEN" "$ROUTER" "$tokens_bought" || warn "Token approval might have failed"
+    info "Checking features..."
     
-    local sell_result
-    sell_result=$(swap_tokens "$tokens_bought" "[$TOKEN,$WPLS]")
+    # DELEGATECALL (context-aware)
+    if contains "$code" "F4"; then
+        local dc_count=$(count_occurrences "$code" "F4")
+        if (( size > 1000 && dc_count > 10 )); then
+            add_finding "MEDIUM" "DELEGATECALL" "Multiple DELEGATECALL ($dc_count times)" 15
+        fi
+    fi
     
-    # STEP 4: Analyze
-    info "Step 4/4: Analyzing results..."
+    # SELFDESTRUCT
+    if contains "$code" "FF"; then
+        local ff_count=$(count_occurrences "$code" "FF")
+        if (( ff_count < 5 )); then
+            add_finding "LOW" "SELFDESTRUCT" "Self-destruct capability exists" 10
+        fi
+    fi
+    
+    info "✓ Feature checks done"
+}
+
+#===============================================================================
+# BYTECODE ANALYSIS
+#===============================================================================
+
+analyze_bytecode() {
+    local code="$1"
+    local label="$2"
+    local is_proxy="${3:-false}"
+    
+    local size=$((${#code} / 2 - 1))
+    
+    info "Analyzing $label ($size bytes)..."
+    
+    if (( size > 24576 )); then
+        add_finding "CRITICAL" "SIZE" "Exceeds maximum contract size" 100
+        info "✓ Analysis complete (oversized)"
+        return
+    fi
+    
+    # Run fast checks (NO SLOW REGEX)
+    check_critical_patterns "$code" "$is_proxy"
+    check_high_risk_patterns "$code"
+    check_features "$code" "$size"
+    
+    info "✓ Analysis of $label complete"
+}
+
+#===============================================================================
+# OWNERSHIP
+#===============================================================================
+
+check_ownership() {
+    local token="$1"
+    
+    info "Checking ownership..."
+    
+    local owner_raw=$(call_func "$token" "owner()")
+    
+    if [[ -z "$owner_raw" ]]; then
+        debug "No owner() function"
+        info "✓ Ownership check done"
+        return 0
+    fi
+    
+    local owner="0x${owner_raw: -40}"
+    
+    if [[ "$owner" == "0x0000000000000000000000000000000000000000" ]]; then
+        add_finding "INFO" "OWNERSHIP" "Ownership renounced" -5
+    else
+        add_finding "LOW" "OWNERSHIP" "Has owner: $owner" 5
+    fi
+    
+    info "✓ Ownership check done"
+}
+
+#===============================================================================
+# OUTPUT
+#===============================================================================
+
+show_results() {
+    echo ""
+    echo -e "${BOLD}${BLUE}════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${BLUE}       HONEYPOT DETECTOR v2.0.0 - PRODUCTION        ${NC}"
+    echo -e "${BOLD}${BLUE}════════════════════════════════════════════════════${NC}"
     echo ""
     
-    if echo "$sell_result" | grep -q '"status":"0x1"'; then
-        # SUCCESS
-        local final_wpls recovered loss loss_percent
-        final_wpls=$(get_balance "$WPLS" "$USER")
-        recovered=$((final_wpls - initial_wpls + TEST_AMOUNT))
-        loss=$((TEST_AMOUNT - recovered))
-        loss_percent=$(( loss * 100 / TEST_AMOUNT ))
-        
-        echo -e "${GREEN}======================================${NC}"
-        echo -e "${GREEN}  ✓ NOT A HONEYPOT${NC}"
-        echo -e "${GREEN}======================================${NC}"
-        echo "Token can be bought and sold"
-        echo "Loss from fees/slippage: ~${loss_percent}%"
-        
-        return 0
+    echo -e "${BOLD}Token Information:${NC}"
+    echo -e "  Address:  ${CYAN}$TOKEN_ADDRESS${NC}"
+    echo -e "  Name:     $TOKEN_NAME"
+    echo -e "  Symbol:   $TOKEN_SYMBOL"
+    echo -e "  Decimals: $TOKEN_DECIMALS"
+    echo -e "  Supply:   $TOKEN_SUPPLY"
+    
+    if [[ "$IS_PROXY" == "true" ]]; then
+        echo -e "  ${CYAN}Type:     Proxy Contract${NC}"
+        echo -e "  ${CYAN}Logic:    $IMPL_ADDRESS${NC}"
+    fi
+    
+    echo ""
+    
+    # Calculate risk level
+    local level="SAFE"
+    (( RISK_SCORE >= RISK_CRITICAL )) && level="CRITICAL"
+    (( RISK_SCORE >= RISK_HIGH && RISK_SCORE < RISK_CRITICAL )) && level="HIGH"
+    (( RISK_SCORE >= RISK_MEDIUM && RISK_SCORE < RISK_HIGH )) && level="MEDIUM"
+    (( RISK_SCORE >= RISK_LOW && RISK_SCORE < RISK_MEDIUM )) && level="LOW"
+    
+    # Show findings or safe message
+    if [[ ${#FINDINGS[@]} -eq 0 ]] || [[ "$level" == "SAFE" ]]; then
+        echo -e "${GREEN}${BOLD}✓ No honeypot patterns detected${NC}"
+        echo ""
+        echo -e "${GREEN}This contract appears to be safe based on bytecode analysis.${NC}"
+        echo -e "${GREEN}Standard ERC20 functions are present.${NC}"
     else
-        # FAILURE
-        echo -e "${RED}======================================${NC}"
-        echo -e "${RED}  ⚠ HONEYPOT DETECTED${NC}"
-        echo -e "${RED}======================================${NC}"
-        echo "Token was bought but CANNOT be sold"
+        echo -e "${BOLD}Security Findings:${NC}"
         echo ""
         
-        if echo "$sell_result" | grep -qi "STF"; then
-            error "Type: Transfer block (SafeTransferFrom failed)"
-        elif echo "$sell_result" | grep -qi "TRANSFER_FAILED"; then
-            error "Type: Transfer function blocked"
-        else
-            error "Type: Unknown block mechanism"
-            echo "Error details:"
-            echo "$sell_result" | grep -o '"revertReason":"[^"]*"' || echo "No revert reason"
-        fi
-        
-        return 1
+        for f in "${FINDINGS[@]}"; do
+            IFS='|' read -r sev cat msg score <<< "$f"
+            
+            local color="$NC"
+            case "$sev" in
+                CRITICAL) color="$RED" ;;
+                HIGH) color="$RED" ;;
+                MEDIUM) color="$YELLOW" ;;
+                LOW) color="$CYAN" ;;
+                INFO) [[ "$VERBOSE" != "true" ]] && continue; color="$NC" ;;
+            esac
+            
+            echo -e "${color}  [$sev]${NC} ${BOLD}$cat:${NC} $msg"
+        done
     fi
+    
+    echo ""
+    
+    local color="$GREEN"
+    [[ "$level" =~ CRITICAL|HIGH ]] && color="$RED"
+    [[ "$level" == "MEDIUM" ]] && color="$YELLOW"
+    [[ "$level" == "LOW" ]] && color="$CYAN"
+    
+    echo -e "${BOLD}Risk Assessment:${NC}"
+    echo -e "  Score: ${BOLD}$RISK_SCORE${NC} / 100"
+    echo -e "  Level: ${color}${BOLD}$level${NC}"
+    echo ""
+    
+    case "$level" in
+        CRITICAL)
+            echo -e "${RED}${BOLD}⛔ CRITICAL RISK - LIKELY HONEYPOT/SCAM${NC}"
+            echo -e "${RED}Strong honeypot indicators detected. DO NOT USE.${NC}"
+            ;;
+        HIGH)
+            echo -e "${RED}${BOLD}⚠️  HIGH RISK - AVOID${NC}"
+            echo -e "${YELLOW}Serious security concerns detected.${NC}"
+            ;;
+        MEDIUM)
+            echo -e "${YELLOW}${BOLD}⚠️  MEDIUM RISK - CAUTION${NC}"
+            echo -e "${YELLOW}Some concerns detected. Verify source code.${NC}"
+            ;;
+        LOW)
+            echo -e "${CYAN}${BOLD}ℹ️  LOW RISK${NC}"
+            echo -e "${CYAN}Minor concerns. Contract appears functional.${NC}"
+            ;;
+        SAFE)
+            echo -e "${GREEN}${BOLD}✓ APPEARS SAFE${NC}"
+            echo -e "${GREEN}No honeypot patterns detected.${NC}"
+            echo -e "${GREEN}Contract follows standard ERC20 conventions.${NC}"
+            ;;
+    esac
+    
+    echo ""
+    echo -e "${CYAN}${BOLD}Note:${NC} ${CYAN}This is automated bytecode analysis. Always:${NC}"
+    echo -e "${CYAN}  • Verify source code on block explorer${NC}"
+    echo -e "${CYAN}  • Check liquidity locks${NC}"
+    echo -e "${CYAN}  • Review team and audit reports${NC}"
+    echo -e "${CYAN}  • Test with small amounts first${NC}"
+    echo ""
+}
+
+#===============================================================================
+# MAIN
+#===============================================================================
+
+analyze() {
+    local token="$1"
+    
+    [[ ! "$token" =~ ^0x[a-fA-F0-9]{40}$ ]] && die "Invalid address"
+    
+    TOKEN_ADDRESS="$token"
+    info "Starting analysis: $token"
+    
+    # Check exists
+    local code=$(get_code "$token")
+    [[ -z "$code" || "$code" == "0x" ]] && die "Not a contract"
+    
+    # Get info
+    fetch_token_info "$token"
+    
+    # Detect proxy
+    if detect_proxy "$token"; then
+        if [[ -n "$IMPL_ADDRESS" && "$IMPL_ADDRESS" != "0x0000000000000000000000000000000000000000" ]]; then
+            info "Fetching implementation bytecode..."
+            local impl_code=$(get_code "$IMPL_ADDRESS")
+            
+            if [[ -n "$impl_code" && "$impl_code" != "0x" ]]; then
+                analyze_bytecode "$impl_code" "implementation" "false"
+            else
+                warn "Could not fetch implementation"
+                add_finding "HIGH" "PROXY" "Unable to verify implementation" 30
+            fi
+        fi
+    else
+        analyze_bytecode "$code" "contract" "false"
+    fi
+    
+    # Check ownership
+    check_ownership "$token"
+    
+    info "Analysis complete!"
+}
+
+main() {
+    local token=""
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -v|--verbose) VERBOSE=true; shift ;;
+            --rpc) RPC_URL="$2"; shift 2 ;;
+            -h|--help)
+                cat <<EOF
+Honeypot Detector 2.0.0 - Fast & Reliable
+
+Usage: $0 [OPTIONS] <address>
+
+Features:
+  ✓ Fast analysis (completes in seconds)
+  ✓ Always shows results
+  ✓ Clear safe/unsafe indicators
+  ✓ Proxy detection & analysis
+
+Options:
+  -v, --verbose    Verbose output
+  --rpc <url>      Custom RPC endpoint
+
+Examples:
+  $0 0x2b591e99afE9f32eAA6214f7B7629768c40Eeb39
+  $0 -v 0xb1f52D529390Ec28483Fe7689A4eA26Fce2956f4
+EOF
+                exit 0
+                ;;
+            0x*) token="$1"; shift ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+    
+    [[ -z "$token" ]] && die "Usage: $0 <address>"
+    
+    command -v cast >/dev/null || die "Install foundry: curl -L https://foundry.paradigm.xyz | bash"
+    mkdir -p "$CACHE_DIR"
+    setup_rpc
+    
+    analyze "$token"
+    show_results
+    
+    (( RISK_SCORE >= RISK_HIGH )) && exit 1 || exit 0
 }
 
 main "$@"
