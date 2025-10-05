@@ -418,8 +418,8 @@ Found a bug? Have a suggestion?
 **Made with ❤️ for the PulseChain community**
 
 *Stay safe out there! 🛡️*
-```
-```
+
+
 ---
 
 ## Key Improvements
