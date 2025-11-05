@@ -1,0 +1,26 @@
+# Honeypot Detector Configuration
+
+[network]
+default_rpc = "https://rpc.pulsechain.com"
+timeout = 30
+
+[rpcs]
+pulsechain = [
+    "https://rpc.pulsechain.com",
+    "https://pulsechain.publicnode.com"
+]
+ethereum = [
+    "https://eth.llamarpc.com",
+    "https://rpc.ankr.com/eth"
+]
+
+[detection]
+# Risk score threshold for honeypot classification
+honeypot_threshold = 60
+
+# Analyzer weights
+[detection.weights]
+static = 0.25
+ml = 0.30
+simulation = 0.35
+proxy = 0.10
