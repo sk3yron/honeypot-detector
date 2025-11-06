@@ -1,6 +1,11 @@
 use honeypot_detector::*;
 use honeypot_detector::blockchain::BlockchainClient;
+use honeypot_detector::analyzers::StaticAnalyzer;
 use std::env;
+use std::sync::Arc;
+
+#[cfg(feature = "ml-inference")]
+use honeypot_detector::analyzers::MLAnalyzer;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -27,7 +32,7 @@ async fn main() -> Result<()> {
         .map(|s| s.as_str())
         .unwrap_or("https://rpc.pulsechain.com");
     
-    println!("🔍 Honeypot Detector");
+    println!("🔍 Honeypot Detector v0.2.0");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
     
     // Parse address
@@ -56,9 +61,30 @@ async fn main() -> Result<()> {
     let target = ContractTarget::new(address)
         .with_bytecode(bytecode);
     
-    // Create detector (no analyzers yet)
-    let detector = HoneypotDetector::new();
+    // Create detector with analyzers
+    let mut detector = HoneypotDetector::new();
     
+    // Always add static analyzer
+    println!("Loading analyzers...");
+    detector = detector.add_analyzer(Arc::new(StaticAnalyzer::new()));
+    println!("✓ Static analyzer loaded");
+    
+    // Optionally add ML analyzer
+    #[cfg(feature = "ml-inference")]
+    {
+        match MLAnalyzer::new("./models") {
+            Ok(ml_analyzer) => {
+                detector = detector.add_analyzer(Arc::new(ml_analyzer));
+                println!("✓ ML analyzer loaded");
+            }
+            Err(e) => {
+                eprintln!("⚠️  Warning: Could not load ML model: {}", e);
+                eprintln!("   Continuing with static analysis only");
+            }
+        }
+    }
+    
+    println!();
     println!("Running analysis...\n");
     
     // Detect
@@ -66,6 +92,11 @@ async fn main() -> Result<()> {
     
     // Print result
     println!("{}", verdict);
+    
+    // Exit code based on result
+    if verdict.is_honeypot {
+        std::process::exit(1);
+    }
     
     Ok(())
 }

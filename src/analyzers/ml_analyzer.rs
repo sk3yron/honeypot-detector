@@ -1,96 +1,140 @@
-// src/analyzers/ml_analyzer.rs
-
-use ndarray::{Array1, Array2};
+#[cfg(feature = "ml-inference")]
 use ort::{Environment, Session, SessionBuilder, Value};
-use std::path::Path;
+#[cfg(feature = "ml-inference")]
+use ndarray::{Array2, CowArray, IxDyn};
+#[cfg(feature = "ml-inference")]
 use std::sync::Arc;
+
+use async_trait::async_trait;
+use std::path::Path;
+use std::collections::HashMap;
 
 use crate::core::Analyzer;
 use crate::features::FeatureExtractor;
 use crate::models::*;
-use crate::utils::errors::{Result, DetectorError};
+use crate::utils::{Result, DetectorError};
 
+#[cfg(feature = "ml-inference")]
 pub struct MLAnalyzer {
     model: Arc<Session>,
     scaler: Arc<Session>,
     feature_extractor: FeatureExtractor,
-    feature_names: Vec<String>,
     metadata: ModelMetadata,
 }
+
+#[cfg(not(feature = "ml-inference"))]
+pub struct MLAnalyzer;
 
 #[derive(Debug, serde::Deserialize)]
 struct ModelMetadata {
     feature_names: Vec<String>,
     n_features: usize,
     model_type: String,
-    metrics: serde_json::Value,
+    metrics: MetricsData,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct MetricsData {
+    #[serde(default)]
+    test_accuracy: serde_json::Value,
+    #[serde(default)]
+    roc_auc: serde_json::Value,
+}
+
+#[cfg(feature = "ml-inference")]
 impl MLAnalyzer {
     pub fn new<P: AsRef<Path>>(models_dir: P) -> Result<Self> {
         let models_dir = models_dir.as_ref();
         
+        tracing::info!("Loading ML model from {:?}", models_dir);
+        
         // Load metadata
         let metadata_path = models_dir.join("model_metadata.json");
+        if !metadata_path.exists() {
+            return Err(DetectorError::MLError(
+                format!("Model metadata not found at {:?}", metadata_path)
+            ));
+        }
+        
         let metadata: ModelMetadata = serde_json::from_str(
             &std::fs::read_to_string(metadata_path)?
         )?;
         
-        // Initialize ONNX Runtime
+        tracing::info!("Model metadata loaded: {} features", metadata.n_features);
+        
+        // Initialize ONNX environment
         let environment = Arc::new(
             Environment::builder()
                 .with_name("honeypot-detector")
-                .build()?
+                .build()
+                .map_err(|e| DetectorError::MLError(format!("ONNX env error: {}", e)))?
         );
         
         // Load scaler
         let scaler_path = models_dir.join("scaler.onnx");
+        if !scaler_path.exists() {
+            return Err(DetectorError::MLError(
+                format!("Scaler not found at {:?}", scaler_path)
+            ));
+        }
+        
         let scaler = Arc::new(
-            SessionBuilder::new(&environment)?
-                .with_model_from_file(scaler_path)?
+            SessionBuilder::new(&environment)
+                .map_err(|e| DetectorError::MLError(format!("Session builder error: {}", e)))?
+                .with_model_from_file(scaler_path)
+                .map_err(|e| DetectorError::MLError(format!("Failed to load scaler: {}", e)))?
         );
+        
+        tracing::info!("Scaler loaded");
         
         // Load model
         let model_path = models_dir.join("honeypot_model.onnx");
+        if !model_path.exists() {
+            return Err(DetectorError::MLError(
+                format!("Model not found at {:?}", model_path)
+            ));
+        }
+        
         let model = Arc::new(
-            SessionBuilder::new(&environment)?
-                .with_model_from_file(model_path)?
+            SessionBuilder::new(&environment)
+                .map_err(|e| DetectorError::MLError(format!("Session builder error: {}", e)))?
+                .with_model_from_file(model_path)
+                .map_err(|e| DetectorError::MLError(format!("Failed to load model: {}", e)))?
         );
+        
+        tracing::info!("ML model loaded successfully");
         
         Ok(Self {
             model,
             scaler,
             feature_extractor: FeatureExtractor::new(),
-            feature_names: metadata.feature_names.clone(),
             metadata,
         })
     }
     
-    /// Extract features and run inference
     pub fn predict(&self, bytecode: &[u8]) -> Result<MLPrediction> {
-        // 1. Extract features (Rust implementation)
-        let features = self.feature_extractor.extract_all_features(bytecode)?;
+        // Extract features
+        let features = self.feature_extractor.extract_features(bytecode)?;
         
-        // 2. Convert to array in correct order
-        let feature_array: Vec<f32> = self.feature_names
-            .iter()
-            .map(|name| *features.get(name).unwrap_or(&0.0) as f32)
-            .collect();
+        // Convert to ordered array matching training
+        let mut feature_vec = Vec::with_capacity(self.metadata.n_features);
+        for name in &self.metadata.feature_names {
+            let value = features.get(name).copied().unwrap_or(0.0);
+            feature_vec.push(value);
+        }
         
-        let n_features = self.metadata.n_features;
-        let input = Array2::from_shape_vec((1, n_features), feature_array)?;
+        // Create ndarray with dynamic dimensions for ort
+        let input = Array2::from_shape_vec((1, self.metadata.n_features), feature_vec)
+            .map_err(|e| DetectorError::MLError(format!("Shape error: {}", e)))?;
         
-        // 3. Scale features
+        // Scale features
         let scaled = self.scale_features(input)?;
         
-        // 4. Run model inference
+        // Run inference
         let (is_honeypot, probabilities) = self.run_inference(scaled)?;
         
-        // 5. Extract top risk features
-        let top_features = self.identify_top_risk_features(&features);
-        
         let honeypot_prob = probabilities[1];
-        let risk_score = (honeypot_prob * 100.0) as u8;
+        let risk_score = (honeypot_prob * 100.0).min(100.0) as u8;
         
         Ok(MLPrediction {
             is_honeypot,
@@ -99,64 +143,84 @@ impl MLAnalyzer {
             honeypot_probability: honeypot_prob as f64,
             safe_probability: probabilities[0] as f64,
             risk_level: Self::risk_level_from_score(risk_score),
-            top_risk_features: top_features,
+            detected_patterns: Self::extract_patterns(&features),
         })
     }
     
     fn scale_features(&self, input: Array2<f32>) -> Result<Array2<f32>> {
-        let input_value = Value::from_array(self.scaler.allocator(), &input)?;
+        // Convert to CowArray for ort
+        let input_cow: CowArray<f32, IxDyn> = CowArray::from(input.into_dyn());
         
-        let outputs = self.scaler.run(vec![input_value])?;
-        let scaled: ndarray::ArrayView2<f32> = outputs[0].try_extract()?;
+        let input_value = Value::from_array(self.scaler.allocator(), &input_cow)
+            .map_err(|e| DetectorError::MLError(format!("Failed to create input value: {}", e)))?;
         
-        Ok(scaled.to_owned())
+        let outputs = self.scaler.run(vec![input_value])
+            .map_err(|e| DetectorError::MLError(format!("Scaler inference failed: {}", e)))?;
+        
+        // Extract output
+        let scaled_dyn = outputs[0].try_extract::<f32>()
+            .map_err(|e| DetectorError::MLError(format!("Failed to extract scaled output: {}", e)))?;
+        
+        // Convert back to Array2
+        let scaled_view = scaled_dyn.view();
+        let shape = scaled_view.shape();
+        let scaled_vec: Vec<f32> = scaled_view.iter().copied().collect();
+        
+        Array2::from_shape_vec((shape[0], shape[1]), scaled_vec)
+            .map_err(|e| DetectorError::MLError(format!("Failed to reshape scaled output: {}", e)))
     }
-    
+
     fn run_inference(&self, input: Array2<f32>) -> Result<(bool, [f32; 2])> {
-        let input_value = Value::from_array(self.model.allocator(), &input)?;
+        // Convert to CowArray for ort
+        let input_cow: CowArray<f32, IxDyn> = CowArray::from(input.into_dyn());
         
-        let outputs = self.model.run(vec![input_value])?;
+        let input_value = Value::from_array(self.model.allocator(), &input_cow)
+            .map_err(|e| DetectorError::MLError(format!("Failed to create input: {}", e)))?;
         
-        // XGBoost output: [label, probabilities]
-        let label: i64 = outputs[0].try_extract::<i64>()?.into_scalar();
-        let probs: ndarray::ArrayView2<f32> = outputs[1].try_extract()?;
+        let outputs = self.model.run(vec![input_value])
+            .map_err(|e| DetectorError::MLError(format!("Model inference failed: {}", e)))?;
         
-        let probabilities = [probs[[0, 0]], probs[[0, 1]]];
+        // XGBoost ONNX output: [label, probabilities]
+        let label_output = outputs[0].try_extract::<i64>()
+            .map_err(|e| DetectorError::MLError(format!("Failed to extract label: {}", e)))?;
+        
+        let probs_output = outputs[1].try_extract::<f32>()
+            .map_err(|e| DetectorError::MLError(format!("Failed to extract probabilities: {}", e)))?;
+        
+        // Get label (first element)
+        let label = label_output.view()[[0]];
+        
+        // Get probabilities
+        let probs_view = probs_output.view();
+        let probabilities = [probs_view[[0, 0]], probs_view[[0, 1]]];
         
         Ok((label == 1, probabilities))
     }
     
-    fn identify_top_risk_features(
-        &self,
-        features: &HashMap<String, f64>
-    ) -> Vec<RiskFeature> {
-        // Known high-risk features (from your Python feature importance)
-        let risk_patterns = [
-            ("has_blacklist_functions", "Blacklist mechanism detected"),
-            ("has_approve_no_transferfrom", "Broken ERC20: approve without transferFrom"),
-            ("missing_transfer", "Missing transfer function"),
-            ("delegatecall_to_storage_pattern", "DELEGATECALL to storage address"),
-            ("conditional_selfdestruct", "Conditional self-destruct"),
-            ("hidden_owner_checks", "Hidden ownership checks"),
-            ("max_jumpi_before_transfer", "Complex transfer conditions"),
-        ];
+    fn extract_patterns(features: &HashMap<String, f32>) -> Vec<String> {
+        let mut patterns = Vec::new();
         
-        risk_patterns
-            .iter()
-            .filter_map(|(feature, desc)| {
-                features.get(*feature).and_then(|&value| {
-                    if value > 0.0 {
-                        Some(RiskFeature {
-                            name: feature.to_string(),
-                            value,
-                            description: desc.to_string(),
-                        })
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect()
+        if features.get("has_blacklist_functions").copied().unwrap_or(0.0) > 0.0 {
+            patterns.push("Blacklist mechanism detected".to_string());
+        }
+        
+        if features.get("has_approve_no_transferfrom").copied().unwrap_or(0.0) > 0.0 {
+            patterns.push("Broken ERC20: approve without transferFrom".to_string());
+        }
+        
+        if features.get("missing_transfer").copied().unwrap_or(0.0) > 0.0 {
+            patterns.push("Missing transfer function".to_string());
+        }
+        
+        if features.get("delegatecall_to_storage_pattern").copied().unwrap_or(0.0) > 0.0 {
+            patterns.push("DELEGATECALL to storage address".to_string());
+        }
+        
+        if features.get("hidden_owner_checks").copied().unwrap_or(0.0) > 0.0 {
+            patterns.push("Hidden ownership checks".to_string());
+        }
+        
+        patterns
     }
     
     fn risk_level_from_score(score: u8) -> String {
@@ -170,28 +234,55 @@ impl MLAnalyzer {
     }
 }
 
+#[cfg(not(feature = "ml-inference"))]
+impl MLAnalyzer {
+    pub fn new<P: AsRef<Path>>(_models_dir: P) -> Result<Self> {
+        Err(DetectorError::MLError(
+            "ML inference not enabled. Build with: cargo build --features ml-inference".to_string()
+        ))
+    }
+}
+
 #[async_trait]
 impl Analyzer for MLAnalyzer {
     fn name(&self) -> &'static str {
         "ml-bytecode-analysis"
     }
     
+    #[cfg(feature = "ml-inference")]
     async fn analyze(&self, target: &ContractTarget) -> Result<AnalysisResult> {
         let bytecode = target.bytecode.as_ref()
             .ok_or_else(|| DetectorError::AnalysisError(
                 "ML analyzer requires bytecode".into()
             ))?;
         
+        tracing::info!("Running ML analysis on {} bytes", bytecode.len());
+        
         let prediction = self.predict(bytecode)?;
+        
+        tracing::info!("ML prediction: {} ({}%)", 
+            if prediction.is_honeypot { "HONEYPOT" } else { "SAFE" },
+            prediction.risk_score
+        );
+        
+        let mut metadata = HashMap::new();
+        metadata.insert("ml_confidence".to_string(), serde_json::json!(prediction.confidence));
+        metadata.insert("ml_risk_level".to_string(), serde_json::json!(prediction.risk_level));
+        metadata.insert("ml_model_accuracy".to_string(), self.metadata.metrics.test_accuracy.clone());
+        metadata.insert("ml_model_roc_auc".to_string(), self.metadata.metrics.roc_auc.clone());
         
         Ok(AnalysisResult {
             risk_score: prediction.risk_score,
             findings: prediction.to_findings(),
-            metadata: hashmap! {
-                "ml_confidence" => json!(prediction.confidence),
-                "ml_risk_level" => json!(prediction.risk_level),
-            },
+            metadata,
         })
+    }
+    
+    #[cfg(not(feature = "ml-inference"))]
+    async fn analyze(&self, _target: &ContractTarget) -> Result<AnalysisResult> {
+        Err(DetectorError::MLError(
+            "ML inference not enabled".to_string()
+        ))
     }
     
     fn weight(&self) -> f64 {
@@ -207,14 +298,7 @@ pub struct MLPrediction {
     pub honeypot_probability: f64,
     pub safe_probability: f64,
     pub risk_level: String,
-    pub top_risk_features: Vec<RiskFeature>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RiskFeature {
-    pub name: String,
-    pub value: f64,
-    pub description: String,
+    pub detected_patterns: Vec<String>,
 }
 
 impl MLPrediction {
@@ -229,19 +313,27 @@ impl MLPrediction {
                 "ML model: {} risk (confidence: {:.1}%)",
                 self.risk_level, self.confidence * 100.0
             ),
-            evidence: None,
+            evidence: Some(serde_json::json!({
+                "risk_score": self.risk_score,
+                "honeypot_probability": self.honeypot_probability,
+            })),
         });
         
         // Specific patterns
-        for feature in &self.top_risk_features {
+        for pattern in &self.detected_patterns {
+            let severity = if pattern.contains("Blacklist") || pattern.contains("Broken ERC20") {
+                Severity::Critical
+            } else if pattern.contains("DELEGATECALL") {
+                Severity::High
+            } else {
+                Severity::Medium
+            };
+            
             findings.push(Finding {
-                severity: Severity::from_description(&feature.description),
+                severity,
                 category: Category::MLPattern,
-                message: feature.description.clone(),
-                evidence: Some(json!({
-                    "feature": feature.name,
-                    "value": feature.value,
-                })),
+                message: pattern.clone(),
+                evidence: None,
             });
         }
         
