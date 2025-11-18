@@ -1,12 +1,10 @@
 use honeypot_detector::*;
 use honeypot_detector::blockchain::BlockchainClient;
-use honeypot_detector::analyzers::StaticAnalyzer;
+use honeypot_detector::analyzers::{StaticAnalyzer, SimulatorAnalyzer};  // <- ADD SimulatorAnalyzer
 use std::env;
 use std::sync::Arc;
-
 #[cfg(feature = "ml-inference")]
 use honeypot_detector::analyzers::MLAnalyzer;
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
@@ -44,17 +42,21 @@ async fn main() -> Result<()> {
     // Connect to blockchain
     println!("Connecting to {}...", rpc_url);
     let client = BlockchainClient::new(rpc_url).await?;
-    println!("✓ Connected to {}\n", client.chain_name());
+    let chain_name = client.chain_name();  // <- Get chain name before moving client
+    println!("✓ Connected to {}\n", chain_name);
+    
+    // Create Arc for sharing client
+    let client_arc = Arc::new(client);  // <- CREATE Arc HERE
     
     // Check if it's a contract
-    if !client.is_contract(address).await? {
+    if !client_arc.is_contract(address).await? {
         eprintln!("❌ Address is not a contract!");
         std::process::exit(1);
     }
     
     // Fetch bytecode
     println!("Fetching bytecode...");
-    let bytecode = client.get_bytecode(address).await?;
+    let bytecode = client_arc.get_bytecode(address).await?;
     println!("✓ Bytecode fetched: {} bytes\n", bytecode.len());
     
     // Create target with bytecode
@@ -68,6 +70,10 @@ async fn main() -> Result<()> {
     println!("Loading analyzers...");
     detector = detector.add_analyzer(Arc::new(StaticAnalyzer::new()));
     println!("✓ Static analyzer loaded");
+    
+    // Add REVM simulator (PulseChain only)
+    detector = detector.add_analyzer(Arc::new(SimulatorAnalyzer::new(client_arc.clone())));
+    println!("✓ REVM simulator loaded");
     
     // Optionally add ML analyzer
     #[cfg(feature = "ml-inference")]

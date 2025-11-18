@@ -1,0 +1,220 @@
+//! Main swap simulation logic
+
+use std::sync::Arc;
+use ethers::types::{Address, U256};
+use crate::blockchain::BlockchainClient;
+use crate::contracts::{IPulseXFactory, IPulseXPair, addresses};
+use crate::storage::LayoutDetector;
+use crate::utils::Result;
+use super::{SwapTest, SwapResult, TestAmounts};
+
+/// Swap simulator for PulseX
+pub struct SwapSimulator {
+    client: Arc<BlockchainClient>,
+}
+
+impl SwapSimulator {
+    pub fn new(client: Arc<BlockchainClient>) -> Self {
+        Self { client }
+    }
+    
+    /// Test swaps for a token
+    pub async fn test_swaps(&self, token: Address) -> Result<SwapTest> {
+        tracing::info!("🔄 Testing PulseX swaps for {:?}", token);
+        
+        // Step 1: Find pair
+        let pair_address = self.find_pair(token).await?;
+        tracing::info!("Found pair: {:?}", pair_address);
+        
+        // Step 2: Get reserves
+        let (reserve_token, reserve_wpls) = self.get_reserves(pair_address, token).await?;
+        tracing::info!(
+            "Reserves: {} tokens, {} WPLS",
+            format_token_amount(reserve_token),
+            format_token_amount(reserve_wpls)
+        );
+        
+        // Step 3: Calculate test amounts
+        let test_amounts = TestAmounts::from_liquidity(reserve_wpls);
+        
+        // Step 4: Detect storage layout
+        let detector = LayoutDetector::new(self.client.clone());
+        let layout = detector.detect(token).await?;
+        tracing::info!("Storage layout: {}", layout.layout);
+        
+        // Step 5: Run buy tests
+        tracing::info!("Testing BUY transactions...");
+        let buy_micro = self.test_buy(token, test_amounts.micro, &layout).await.ok();
+        let buy_normal = self.test_buy(token, test_amounts.normal, &layout).await.ok();
+        let buy_large = self.test_buy(token, test_amounts.large, &layout).await.ok();
+        
+        // Step 6: Run sell tests
+        tracing::info!("Testing SELL transactions...");
+        let sell_micro = self.test_sell(token, test_amounts.micro, &layout).await.ok();
+        let sell_normal = self.test_sell(token, test_amounts.normal, &layout).await.ok();
+        let sell_large = self.test_sell(token, test_amounts.large, &layout).await.ok();
+        
+        // Step 7: Calculate metrics
+        let avg_buy_tax = calculate_avg_tax(&[&buy_micro, &buy_normal, &buy_large]);
+        let avg_sell_tax = calculate_avg_tax(&[&sell_micro, &sell_normal, &sell_large]);
+        
+        // Step 8: Detect patterns
+        let has_overflow_trap = detect_overflow(&buy_normal, &buy_large);
+        let has_amount_limits = detect_amount_limits(&buy_micro, &buy_normal, &buy_large)
+            || detect_amount_limits(&sell_micro, &sell_normal, &sell_large);
+        
+        Ok(SwapTest {
+            buy_micro,
+            buy_normal,
+            buy_large,
+            sell_micro,
+            sell_normal,
+            sell_large,
+            avg_buy_tax,
+            avg_sell_tax,
+            has_overflow_trap,
+            has_amount_limits,
+        })
+    }
+    
+    /// Find PulseX pair for token
+    async fn find_pair(&self, token: Address) -> Result<Address> {
+        let factory = IPulseXFactory::new(
+            addresses::pulsex_factory(),
+            self.client.provider.clone(),
+        );
+        
+        let pair = factory.get_pair(token, addresses::wpls()).await
+            .map_err(|e| crate::utils::DetectorError::ContractCallError(
+                format!("Failed to get pair: {}", e)
+            ))?;
+        
+        // Check if pair exists
+        if pair == Address::zero() {
+            return Err(crate::utils::DetectorError::AnalysisError(
+                "No PulseX pair found for token".to_string()
+            ));
+        }
+        
+        Ok(pair)
+    }
+    
+    /// Get reserves from pair
+    async fn get_reserves(
+        &self,
+        pair: Address,
+        token: Address,
+    ) -> Result<(U256, U256)> {
+        let pair_contract = IPulseXPair::new(pair, self.client.provider.clone());
+        
+        let (reserve0, reserve1, _timestamp) = pair_contract.get_reserves().await
+            .map_err(|e| crate::utils::DetectorError::ContractCallError(
+                format!("Failed to get reserves: {}", e)
+            ))?;
+        
+        // Determine which reserve is token vs WPLS
+        let token0 = pair_contract.token_0().await
+            .map_err(|e| crate::utils::DetectorError::ContractCallError(
+                format!("Failed to get token0: {}", e)
+            ))?;
+        
+        let (reserve_token, reserve_wpls) = if token0 == token {
+            (U256::from(reserve0), U256::from(reserve1))
+        } else {
+            (U256::from(reserve1), U256::from(reserve0))
+        };
+        
+        Ok((reserve_token, reserve_wpls))
+    }
+    
+    /// Test buy transaction (simplified for now)
+    async fn test_buy(
+        &self,
+        _token: Address,
+        _amount: U256,
+        _layout: &crate::storage::LayoutInfo,
+    ) -> Result<SwapResult> {
+        // TODO: Implement full buy simulation in REVM
+        // For now, return placeholder
+        Ok(SwapResult {
+            success: true,
+            amount_in: _amount,
+            amount_out: U256::zero(),
+            gas_used: 200_000,
+            revert_reason: None,
+            tax_percent: 0.0,
+        })
+    }
+    
+    /// Test sell transaction (simplified for now)
+    async fn test_sell(
+        &self,
+        _token: Address,
+        _amount: U256,
+        _layout: &crate::storage::LayoutInfo,
+    ) -> Result<SwapResult> {
+        // TODO: Implement full sell simulation in REVM
+        // For now, return placeholder
+        Ok(SwapResult {
+            success: true,
+            amount_in: _amount,
+            amount_out: U256::zero(),
+            gas_used: 250_000,
+            revert_reason: None,
+            tax_percent: 0.0,
+        })
+    }
+}
+
+// Helper functions
+
+fn format_token_amount(amount: U256) -> String {
+    let decimals = U256::from(10).pow(U256::from(18));
+    let whole = amount / decimals;
+    format!("{}", whole)
+}
+
+fn calculate_avg_tax(results: &[&Option<SwapResult>]) -> f64 {
+    let valid_results: Vec<f64> = results
+        .iter()
+        .filter_map(|r| r.as_ref())
+        .filter(|r| r.success)
+        .map(|r| r.tax_percent)
+        .collect();
+    
+    if valid_results.is_empty() {
+        return 0.0;
+    }
+    
+    valid_results.iter().sum::<f64>() / valid_results.len() as f64
+}
+
+fn detect_overflow(normal: &Option<SwapResult>, large: &Option<SwapResult>) -> bool {
+    match (normal, large) {
+        (Some(n), Some(l)) => {
+            // If normal succeeds but large fails, might be U112 overflow
+            n.success && !l.success
+        }
+        _ => false,
+    }
+}
+
+fn detect_amount_limits(
+    micro: &Option<SwapResult>,
+    normal: &Option<SwapResult>,
+    large: &Option<SwapResult>,
+) -> bool {
+    // Different results for different amounts suggests amount-dependent logic
+    let results: Vec<bool> = [micro, normal, large]
+        .iter()
+        .filter_map(|r| r.as_ref())
+        .map(|r| r.success)
+        .collect();
+    
+    if results.len() < 2 {
+        return false;
+    }
+    
+    // If not all the same, there's amount-dependent behavior
+    !results.iter().all(|&r| r == results[0])
+}

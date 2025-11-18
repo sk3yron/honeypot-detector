@@ -8,6 +8,9 @@ pub enum DetectorError {
     #[error("RPC error: {0}")]
     RpcError(#[from] ethers::providers::ProviderError),
     
+    #[error("Contract error: {0}")]
+    ContractError(String),
+    
     #[error("Contract not found at address {0}")]
     ContractNotFound(String),
     
@@ -19,6 +22,9 @@ pub enum DetectorError {
     
     #[error("Simulation failed: {0}")]
     SimulationError(String),
+    
+    #[error("Contract call error: {0}")]
+    ContractCallError(String),
     
     #[error("JSON error: {0}")]
     JsonError(#[from] serde_json::Error),

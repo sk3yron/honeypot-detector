@@ -1,3 +1,7 @@
+pub mod contracts;      // NEW - PulseX contract interfaces
+pub mod storage;        // NEW - Storage layout detection
+pub mod verification;   // NEW - Factory verification (Tier 0)
+
 pub mod core;
 pub mod models;
 pub mod analyzers;

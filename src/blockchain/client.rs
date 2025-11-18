@@ -4,7 +4,7 @@ use crate::utils::{Result, DetectorError};
 
 /// Blockchain RPC client
 pub struct BlockchainClient {
-    provider: Arc<Provider<Http>>,
+    pub(crate) provider: Arc<Provider<Http>>,
     chain_id: u64,
 }
 
