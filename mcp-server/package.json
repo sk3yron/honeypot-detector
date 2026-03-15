@@ -1,0 +1,22 @@
+{
+  "name": "honeypot-detector-mcp",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "MCP server providing tools for Claude to analyze smart contracts for honeypot detection",
+  "main": "honeypot-tools.ts",
+  "scripts": {
+    "build": "tsc",
+    "start": "node --loader ts-node/esm honeypot-tools.ts",
+    "test": "node --loader ts-node/esm test-comprehensive.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "axios": "^1.6.0",
+    "ethers": "^6.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.25",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}

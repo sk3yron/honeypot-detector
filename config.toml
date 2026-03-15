@@ -18,9 +18,24 @@ ethereum = [
 # Risk score threshold for honeypot classification
 honeypot_threshold = 60
 
-# Analyzer weights
+# Analyzer weights (must sum to 1.0)
 [detection.weights]
-static = 0.25
-ml = 0.30
-simulation = 0.35
-proxy = 0.10
+static = 0.25      # Bytecode pattern analysis
+claude = 0.35      # Claude AI primary analyzer (via MCP)
+ml = 0.15          # Machine learning (if enabled)
+simulation = 0.25  # REVM simulation
+
+# Claude Configuration
+[claude]
+default_mode = "hybrid"  # quick, hybrid, or deep
+enabled = true
+
+[claude.budgets]
+quick_max_tokens = 50000
+hybrid_max_tokens = 100000
+deep_max_tokens = 200000
+
+[claude.timeouts]
+quick_seconds = 300   # 5 min
+hybrid_seconds = 900  # 15 min
+deep_seconds = 1800   # 30 min

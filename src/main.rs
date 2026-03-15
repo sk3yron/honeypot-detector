@@ -1,12 +1,16 @@
 use honeypot_detector::*;
 use honeypot_detector::blockchain::BlockchainClient;
-use honeypot_detector::analyzers::{StaticAnalyzer, SimulatorAnalyzer};  // <- ADD SimulatorAnalyzer
+use honeypot_detector::analyzers::{StaticAnalyzer, SimulatorAnalyzer, ClaudeAnalyzer, AnalysisMode};
 use std::env;
 use std::sync::Arc;
 #[cfg(feature = "ml-inference")]
 use honeypot_detector::analyzers::MLAnalyzer;
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load environment variables
+    dotenv::dotenv().ok();
+    
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -18,17 +22,38 @@ async fn main() -> Result<()> {
     // Parse arguments
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <token_address> [rpc_url]", args[0]);
+        eprintln!("Usage: {} <token_address> [rpc_url] [options]", args[0]);
+        eprintln!("\nOptions:");
+        eprintln!("  --claude-mode=<MODE>    Claude analysis mode: quick, hybrid (default), or deep");
+        eprintln!("  --no-claude             Disable Claude analyzer");
         eprintln!("\nExamples:");
         eprintln!("  {} 0xA1077a294dDE1B09bB078844df40758a5D0f9a27", args[0]);
         eprintln!("  {} 0xA1077a294dDE1B09bB078844df40758a5D0f9a27 https://rpc.pulsechain.com", args[0]);
+        eprintln!("  {} 0xA1077a294dDE1B09bB078844df40758a5D0f9a27 --claude-mode=deep", args[0]);
         std::process::exit(1);
     }
     
     let address_str = &args[1];
-    let rpc_url = args.get(2)
-        .map(|s| s.as_str())
-        .unwrap_or("https://rpc.pulsechain.com");
+    
+    // Parse optional arguments
+    let mut rpc_url = "https://rpc.pulsechain.com";
+    let mut claude_mode = AnalysisMode::Hybrid; // Default mode
+    let mut enable_claude = true;
+    
+    for arg in args.iter().skip(2) {
+        if arg.starts_with("--claude-mode=") {
+            let mode_str = arg.strip_prefix("--claude-mode=").unwrap();
+            claude_mode = AnalysisMode::from_str(mode_str)
+                .unwrap_or_else(|| {
+                    eprintln!("Invalid mode '{}'. Using hybrid mode.", mode_str);
+                    AnalysisMode::Hybrid
+                });
+        } else if arg == "--no-claude" {
+            enable_claude = false;
+        } else if arg.starts_with("http") {
+            rpc_url = arg;
+        }
+    }
     
     println!("🔍 Honeypot Detector v0.2.0");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
@@ -81,13 +106,28 @@ async fn main() -> Result<()> {
         match MLAnalyzer::new("./models") {
             Ok(ml_analyzer) => {
                 detector = detector.add_analyzer(Arc::new(ml_analyzer));
-                println!("✓ ML analyzer loaded");
+                println!("✓ ML analyzer loaded (weight: 15%)");
             }
             Err(e) => {
                 eprintln!("⚠️  Warning: Could not load ML model: {}", e);
-                eprintln!("   Continuing with static analysis only");
             }
         }
+    }
+    
+    // Add Claude analyzer (primary AI, 35% weight)
+    if enable_claude {
+        match ClaudeAnalyzer::new(claude_mode, client_arc.clone(), rpc_url.to_string()) {
+            Ok(claude_analyzer) => {
+                detector = detector.add_analyzer(Arc::new(claude_analyzer));
+                println!("✓ Claude analyzer loaded ({:?} mode, weight: 35%)", claude_mode);
+            }
+            Err(e) => {
+                eprintln!("⚠️  Warning: Could not load Claude analyzer: {}", e);
+                eprintln!("   Continuing without Claude (graceful degradation)");
+            }
+        }
+    } else {
+        println!("ℹ️  Claude analyzer disabled");
     }
     
     println!();

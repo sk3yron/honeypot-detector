@@ -32,6 +32,18 @@ pub enum DetectorError {
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
     
+    #[error("Cache error: {0}")]
+    CacheError(String),
+    
+    #[error("Network error: {0}")]
+    NetworkError(String),
+    
+    #[error("Configuration error: {0}")]
+    ConfigError(String),
+    
+    #[error("{0}")]
+    Other(String),
+    
     #[cfg(feature = "ml-inference")]
     #[error("ONNX error: {0}")]
     OnnxError(#[from] ort::OrtError), 

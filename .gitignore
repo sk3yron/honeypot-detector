@@ -19,12 +19,14 @@ Cargo.lock
 # Cache
 .cache/
 *.cache
+cache/
 
 # ML Models
 models/*.onnx
 models/*.pkl
 
 # Logs
+logs/
 *.log
 
 # OS
